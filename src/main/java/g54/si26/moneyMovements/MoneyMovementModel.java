@@ -1,14 +1,129 @@
 package g54.si26.moneyMovements;
 
 import java.util.List;
+import java.util.ArrayList;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import g54.si26.DTOs.EnrollmentRecordDTO;
 import g54.si26.DTOs.TeacherInvoiceDTO;
 import g54.si26.DTOs.MoneyMovementDTO;
 import g54.si26.utils.Database;
 import g54.si26.utils.ApplicationException;
+import g54.si26.utils.Util;
 
 public class MoneyMovementModel {
     private Database db = new Database();
+    private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
+    // ====================================================================================
+    // REFACTORIZACION PARA TESTING DE LOGICA DE NEGOCIO: Validaciones puras en el modelo
+    // ====================================================================================
+
+    public List<String> validateEnrollmentMovement(int inscriptionId, double amount, LocalDate moveDate, LocalDate simulatedDate) throws ApplicationException {
+        List<String> warnings = new ArrayList<>();
+        
+        // DATE VALIDATION
+        if (simulatedDate != null && moveDate.isAfter(simulatedDate)) {
+            throw new ApplicationException("Movement date (" + moveDate + ") cannot be in the future (System date: " + simulatedDate + ").");
+        }
+        
+        if (Math.abs(amount) < 0.001) {
+            throw new ApplicationException("Amount cannot be zero.");
+        }
+
+        List<EnrollmentRecordDTO> all = getAllEnrollments();
+        EnrollmentRecordDTO selected = all.stream().filter(e -> e.getInscriptionId() == inscriptionId).findFirst().orElse(null);
+        
+        if (selected == null) {
+            throw new ApplicationException("Selected enrollment not found in database.");
+        }
+
+        if (amount > 0) {
+            // Positive payment logic
+            String rDateStr = selected.getRegistrationDate();
+            if (rDateStr != null) {
+                if (rDateStr.length() > 10) rDateStr = rDateStr.substring(0, 10);
+                LocalDate regDate = LocalDate.parse(rDateStr, FORMATTER);
+                
+                if (moveDate.isBefore(regDate)) {
+                    throw new ApplicationException("Movement date cannot be before inscription date (" + rDateStr + ").");
+                }
+                
+                if (Util.isAfterTwoWorkingDays(regDate, moveDate)) {
+                    throw new ApplicationException("Movement is more than 2 working days after inscription date (" + rDateStr + ").");
+                }
+            }
+            
+            // Overpayment warning: TotalPaid + amount > Fee
+            if (selected.getNetBalance() + amount > selected.getFee() + 0.001) {
+                warnings.add("This movement will result in an overpayment for the professional.");
+            }
+        } else if (amount < 0) {
+            // Negative movement (compensation)
+            double overpayment = selected.getNetBalance() - selected.getFee();
+            if (overpayment <= 0.001) {
+                throw new ApplicationException("Negative movements are only allowed for compensation (when an overpayment exists). Current overpayment is 0.00.");
+            } else {
+                double absAmount = Math.abs(amount);
+                if (absAmount > overpayment + 0.001) {
+                    throw new ApplicationException(String.format("Compensation movement (%.2f) cannot be greater than the overpaid amount (%.2f).", absAmount, overpayment));
+                } else if (absAmount < overpayment - 0.001) {
+                    warnings.add(String.format("This compensation movement (%.2f) is lower than the required amount to fully compensate (%.2f).", absAmount, overpayment));
+                }
+            }
+        }
+        
+        return warnings;
+    }
+
+    public List<String> validateInvoiceMovement(int invoiceId, double amount, LocalDate moveDate, LocalDate simulatedDate) throws ApplicationException {
+        List<String> warnings = new ArrayList<>();
+
+        if (simulatedDate != null && moveDate.isAfter(simulatedDate)) {
+            throw new ApplicationException("Movement date (" + moveDate + ") cannot be in the future (System date: " + simulatedDate + ").");
+        }
+
+        if (Math.abs(amount) < 0.001) {
+            throw new ApplicationException("Amount cannot be zero.");
+        }
+
+        List<TeacherInvoiceDTO> all = getAllInvoices();
+        TeacherInvoiceDTO selected = all.stream().filter(i -> i.getInvoiceId() == invoiceId).findFirst().orElse(null);
+        
+        if (selected == null) {
+            throw new ApplicationException("Selected invoice not found in database.");
+        }
+
+        double currentNetPaid = selected.getNetBalance(); // Sum of movements (usually negative for expenses)
+        double totalInvoice = selected.getTotalAmount();
+        
+        // DATE VALIDATION (Movement cannot be before invoice)
+        String invDateStr = selected.getInvoiceDate();
+        if (invDateStr != null) {
+            if (invDateStr.length() > 10) invDateStr = invDateStr.substring(0, 10);
+            LocalDate invDate = LocalDate.parse(invDateStr, FORMATTER);
+            if (moveDate.isBefore(invDate)) {
+                throw new ApplicationException("Movement date cannot be before invoice date (" + invDateStr + ").");
+            }
+        }
+        
+        if (amount > 0) {
+            // Positive movement for an invoice (income/refund from teacher)
+            if (Math.abs(currentNetPaid) <= totalInvoice + 0.001) {
+                throw new ApplicationException("Outgoing movements (invoice payments) must be represented as negative numbers. Use a positive number only for teacher refunds of an overpayment.");
+            }
+        } else if (amount < 0) {
+            // Overcharge warning (Expenses are negative): |currentNetPaid + amount| > totalInvoice
+            if (Math.abs(currentNetPaid + amount) > totalInvoice + 0.001) {
+                warnings.add("This movement will result in an overcharge (payment exceeding the invoice amount).");
+            }
+        }
+        return warnings;
+    }
+
+    // ====================================================================================
+    // METODOS PRE-EXISTENTES (Consultas y transacciones a BBDD)
+    // ====================================================================================
 
     public List<EnrollmentRecordDTO> getAllEnrollments() {
         String sql = "SELECT " +

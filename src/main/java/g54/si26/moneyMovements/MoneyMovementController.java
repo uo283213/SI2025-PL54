@@ -6,7 +6,7 @@ import javax.swing.table.DefaultTableModel;
 import g54.si26.DTOs.EnrollmentRecordDTO;
 import g54.si26.DTOs.TeacherInvoiceDTO;
 import g54.si26.DTOs.MoneyMovementDTO;
-import g54.si26.utils.Util;
+import g54.si26.utils.ApplicationException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 
@@ -156,6 +156,7 @@ public class MoneyMovementController {
         List<String> warnings = new java.util.ArrayList<>();
 
         try {
+            // Parse Amount
             double amount = 0;
             String amountStr = view.getTxtAmount().getText().trim().replace(",", ".");
             if (amountStr.isEmpty()) {
@@ -167,140 +168,75 @@ public class MoneyMovementController {
                     errors.add("Amount must be a valid number.");
                 }
             }
-            
-            if (Math.abs(amount) < 0.001) {
-                errors.add("Amount cannot be zero.");
-            }
 
+            // Parse Date
             String dateStr = view.getTxtDate().getText().trim();
-            int id = (int) view.getTableMain().getValueAt(row, 0);
-
-            // DATE VALIDATION
             LocalDate moveDate = null;
             if (dateStr.isEmpty()) {
                 errors.add("Date is required.");
             } else {
                 try {
                     moveDate = LocalDate.parse(dateStr, FORMATTER);
-                    if (simulatedDate != null && !simulatedDate.isEmpty()) {
-                        LocalDate sysDate = LocalDate.parse(simulatedDate, FORMATTER);
-                        if (moveDate.isAfter(sysDate)) {
-                            errors.add("Movement date (" + dateStr + ") cannot be in the future (System date: " + simulatedDate + ").");
-                        }
-                    }
                 } catch (Exception ex) {
                     errors.add("Invalid date format. Use YYYY-MM-DD.");
                 }
             }
 
-            if (view.getRdEnrollments().isSelected()) {
-                List<EnrollmentRecordDTO> all = model.getAllEnrollments();
-                EnrollmentRecordDTO selected = all.stream().filter(e -> e.getInscriptionId() == id).findFirst().orElse(null);
-                
-                if (selected != null) {
-                    if (amount > 0) {
-                        // Positive payment logic
-                        if (moveDate != null) {
-                            String rDateStr = selected.getRegistrationDate();
-                            if (rDateStr != null) {
-                                if (rDateStr.length() > 10) rDateStr = rDateStr.substring(0, 10);
-                                LocalDate regDate = LocalDate.parse(rDateStr, FORMATTER);
-                                
-                                if (moveDate.isBefore(regDate)) {
-                                    errors.add("Movement date cannot be before inscription date (" + rDateStr + ").");
-                                }
-                                
-                                if (Util.isAfterTwoWorkingDays(regDate, moveDate)) {
-                                     errors.add("Movement is more than 2 working days after inscription date (" + rDateStr + ").");
-                                }
-                            }
-                        }
-                        
-                        // Overpayment warning: TotalPaid + amount > Fee
-                        if (selected.getNetBalance() + amount > selected.getFee() + 0.001) {
-                            warnings.add("This movement will result in an overpayment for the professional.");
-                        }
-                    } else if (amount < 0) {
-                        // Negative movement (compensation)
-                        double overpayment = selected.getNetBalance() - selected.getFee();
-                        if (overpayment <= 0.001) {
-                            errors.add("Negative movements are only allowed for compensation (when an overpayment exists). Current overpayment is 0.00.");
-                        } else {
-                            double absAmount = Math.abs(amount);
-                            if (absAmount > overpayment + 0.001) {
-                                errors.add(String.format("Compensation movement (%.2f) cannot be greater than the overpaid amount (%.2f).", absAmount, overpayment));
-                            } else if (absAmount < overpayment - 0.001) {
-                                warnings.add(String.format("This compensation movement (%.2f) is lower than the required amount to fully compensate (%.2f).", absAmount, overpayment));
-                            }
-                        }
-                    }
-                } else {
-                    errors.add("Selected enrollment not found in database.");
+            // Parse Simulated Date
+            LocalDate sysDate = null;
+            if (simulatedDate != null && !simulatedDate.isEmpty()) {
+                try {
+                    sysDate = LocalDate.parse(simulatedDate, FORMATTER);
+                } catch (Exception ex) {
+                    // Ignoramos, será manejado por el modelo o asumimos now() si hiciera falta.
                 }
-            } else {
-                // Invoices validation
-                List<TeacherInvoiceDTO> all = model.getAllInvoices();
-                TeacherInvoiceDTO selected = all.stream().filter(i -> i.getInvoiceId() == id).findFirst().orElse(null);
-                
-                if (selected != null) {
-                    double currentNetPaid = selected.getNetBalance(); // Sum of movements (usually negative for expenses)
-                    double totalInvoice = selected.getTotalAmount();
-                    
-                    // DATE VALIDATION (Movement cannot be before invoice)
-                    if (moveDate != null) {
-                        String invDateStr = selected.getInvoiceDate();
-                        if (invDateStr != null) {
-                            if (invDateStr.length() > 10) invDateStr = invDateStr.substring(0, 10);
-                            LocalDate invDate = LocalDate.parse(invDateStr, FORMATTER);
-                            if (moveDate.isBefore(invDate)) {
-                                errors.add("Movement date cannot be before invoice date (" + invDateStr + ").");
-                            }
-                        }
+            }
+
+            int id = (int) view.getTableMain().getValueAt(row, 0);
+
+            // ==============================================================================
+            // AQUI OCURRE LA MAGIA DE LA REFACTORIZACIÓN
+            // Delegamos tooooda la lógica de negocio, validaciones complejas y reglas al MODELO
+            // ==============================================================================
+            if (errors.isEmpty()) {
+                try {
+                    if (view.getRdEnrollments().isSelected()) {
+                        warnings = model.validateEnrollmentMovement(id, amount, moveDate, sysDate);
+                    } else {
+                        warnings = model.validateInvoiceMovement(id, amount, moveDate, sysDate);
                     }
-                    
-                    if (amount > 0) {
-                        // Positive movement for an invoice (income/refund from teacher)
-                        if (Math.abs(currentNetPaid) <= totalInvoice + 0.001) {
-                            errors.add("Outgoing movements (invoice payments) must be represented as negative numbers. Use a positive number only for teacher refunds of an overpayment.");
-                        }
-                    } else if (amount < 0) {
-                        // Overcharge warning (Expenses are negative): |currentNetPaid + amount| > totalInvoice
-                        if (Math.abs(currentNetPaid + amount) > totalInvoice + 0.001) {
-                            warnings.add("This movement will result in an overcharge (payment exceeding the invoice amount).");
-                        }
-                    }
-                } else {
-                    errors.add("Selected invoice not found in database.");
+                } catch (ApplicationException ae) {
+                    errors.add(ae.getMessage());
                 }
             }
 
             // Display errors if any
             if (!errors.isEmpty()) {
-                StringBuilder sb = new StringBuilder("The following errors were detected:\n\n");
-                for (String err : errors) sb.append(" - ").append(err).append("\n");
-                if (!warnings.isEmpty()) {
-                    sb.append("\nAlso, the following warnings were detected:\n\n");
-                    for (String warn : warnings) sb.append(" - ").append(warn).append("\n");
-                }
+                StringBuilder sb = new StringBuilder("The following errors were detected:\\n\\n");
+                for (String err : errors) sb.append(" - ").append(err).append("\\n");
                 JOptionPane.showMessageDialog(view.getFrame(), sb.toString(), "Error", JOptionPane.ERROR_MESSAGE);
                 return;
             }
 
             // Display warnings if no errors
             if (!warnings.isEmpty()) {
-                StringBuilder sb = new StringBuilder("The following warnings were detected:\n\n");
-                for (String warn : warnings) sb.append(" - ").append(warn).append("\n");
-                sb.append("\nDo you want to proceed anyway?");
+                StringBuilder sb = new StringBuilder("The following warnings were detected:\\n\\n");
+                for (String warn : warnings) sb.append(" - ").append(warn).append("\\n");
+                sb.append("\\nDo you want to proceed anyway?");
                 int choice = JOptionPane.showConfirmDialog(view.getFrame(), sb.toString(), "Warning", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
                 if (choice != JOptionPane.YES_OPTION) return;
             }
 
-            model.registerMovement(view.getRdEnrollments().isSelected() ? id : null, 
-                                   view.getRdInvoices().isSelected() ? id : null, 
-                                   amount, dateStr, "EXECUTED");
+            // Si llegamos hasta aquí, la validación del modelo ha pasado limpiamente
+            model.registerMovement(
+                view.getRdEnrollments().isSelected() ? id : null, 
+                view.getRdInvoices().isSelected() ? id : null, 
+                amount, dateStr, "EXECUTED"
+            );
 
             updateTables();
             JOptionPane.showMessageDialog(view.getFrame(), "Movement registered successfully.");
+            
         } catch (Exception e) {
             e.printStackTrace();
             JOptionPane.showMessageDialog(view.getFrame(), "Unexpected error: " + e.getMessage());
